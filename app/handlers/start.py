@@ -1,11 +1,17 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.db import fetchrow, execute
 from app.keyboards import phone_request_kb
 
 router = Router()
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Каталог послуг", callback_data="CATALOG:OPEN")],
+        [InlineKeyboardButton(text="🆘 Підтримка", callback_data="SUPPORT:OPEN")],
+    ])
 
 async def _get_client_by_tg_id(tg_id: int):
     return await fetchrow(
@@ -20,16 +26,15 @@ async def cmd_start(message: Message):
 
     if client is None or not client["phone"]:
         await message.answer(
-            "Вітаю! Для користування ботом надішліть номер телефону.",
+            "Вітаю! Для користування ботом поділіться номером телефону.",
             reply_markup=phone_request_kb()
         )
         return
 
     await message.answer(
-        "З поверненням! Телефон уже збережено, можемо переходити до каталогу послуг.",
-        reply_markup=ReplyKeyboardRemove()
+        "З поверненням! 👋\nОберіть дію:",
+        reply_markup=main_menu_kb()
     )
-
 
 @router.message(F.contact)
 async def got_contact(message: Message):
@@ -63,6 +68,6 @@ async def got_contact(message: Message):
         )
 
     await message.answer(
-        "Дякую! Номер збережено ✅",
-        reply_markup=ReplyKeyboardRemove()
+        "Дякую! Номер збережено ✅\nОберіть дію:",
+        reply_markup=main_menu_kb()
     )
