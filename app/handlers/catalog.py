@@ -1,6 +1,8 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
+from app.handlers.start import main_menu_kb
+
 router = Router()
 
 CATEGORIES = {
@@ -66,5 +68,8 @@ async def pick_service(cb: CallbackQuery):
 
 @router.callback_query(F.data == "START:MENU")
 async def back_to_menu(cb: CallbackQuery):
-    await cb.message.edit_text("Головне меню: натисніть /start")
     await cb.answer()
+    await cb.message.edit_text(
+        "Добрий день! 👋\nОберіть дію:",
+        reply_markup=main_menu_kb()
+    )

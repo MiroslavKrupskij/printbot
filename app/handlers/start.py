@@ -1,9 +1,10 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.db import fetchrow, execute
-from app.keyboards import phone_request_kb
+from app.keyboards import phone_request_kb, persistent_menu_kb
+from app.handlers.admin import admin_menu_kb, _is_admin
 
 router = Router()
 
@@ -31,10 +32,18 @@ async def cmd_start(message: Message):
         )
         return
 
-    await message.answer(
-        "З поверненням! 👋\nОберіть дію:",
-        reply_markup=main_menu_kb()
-    )
+    if await _is_admin(tg_id):
+        await message.answer(
+            "Адмін-меню:",
+            reply_markup=persistent_menu_kb()
+        )
+        await message.answer("Оберіть дію:", reply_markup=admin_menu_kb())
+    else:
+        await message.answer(
+            "З поверненням! 👋",
+            reply_markup=persistent_menu_kb()
+        )
+        await message.answer("Меню:", reply_markup=main_menu_kb())
 
 @router.message(F.contact)
 async def got_contact(message: Message):
@@ -68,6 +77,26 @@ async def got_contact(message: Message):
         )
 
     await message.answer(
-        "Дякую! Номер збережено ✅\nОберіть дію:",
-        reply_markup=main_menu_kb()
+        "Дякую! Номер збережено ✅",
+        reply_markup=persistent_menu_kb()
     )
+    await message.answer("Меню:", reply_markup=main_menu_kb())
+
+@router.message(F.text == "☰ Меню")
+async def open_menu(message: Message):
+    tg_id = message.from_user.id
+
+    if await _is_admin(tg_id):
+        await message.answer("Адмін-меню:", reply_markup=admin_menu_kb())
+        return
+
+    client = await _get_client_by_tg_id(tg_id)
+
+    if client is None or not client["phone"]:
+        await message.answer(
+            "Для користування ботом поділіться номером телефону.",
+            reply_markup=phone_request_kb()
+        )
+        return
+
+    await message.answer("Меню:", reply_markup=main_menu_kb())
