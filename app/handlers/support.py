@@ -3,9 +3,10 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-from app.db import fetchrow, execute
-from app.enums import SupportStatus
 from app.keyboards import support_request_kb
+from app.services.auth import get_client_id_by_tg
+from app.services.support_service import create_support_request, notify_admins_about_support
+from app.texts import support_topic_prompt, support_message_prompt
 
 router = Router()
 
@@ -13,22 +14,11 @@ class SupportFSM(StatesGroup):
     topic = State()
     message = State()
 
-async def _get_client_id_by_tg(tg_id: int):
-    row = await fetchrow("SELECT client_id FROM clients WHERE telegram_id=$1", tg_id)
-    return row["client_id"] if row else None
-
-async def _admin_ids():
-    row = await fetchrow("SELECT array_agg(telegram_id) AS ids FROM admins WHERE is_active=TRUE")
-    return row["ids"] if row and row["ids"] else []
-
 @router.callback_query(F.data == "SUPPORT:OPEN")
 async def support_open(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(SupportFSM.topic)
-    await cb.message.edit_text(
-        "Підтримка\n\n"
-        "Вкажіть тему звернення одним коротким повідомленням («Питання по замовленню» і.т.д.)."
-    )
+    await cb.message.edit_text(support_topic_prompt())
     await cb.answer()
 
 @router.message(SupportFSM.topic)
@@ -40,51 +30,38 @@ async def support_topic(message: Message, state: FSMContext):
 
     await state.update_data(topic=topic)
     await state.set_state(SupportFSM.message)
-    await message.answer("Опишіть детально проблему одним повідомленням.")
+    await message.answer(support_message_prompt())
 
 @router.message(SupportFSM.message)
 async def support_message(message: Message, state: FSMContext):
     tg_id = message.from_user.id
-    client_id = await _get_client_id_by_tg(tg_id)
+    client_id = await get_client_id_by_tg(tg_id)
     if not client_id:
         await message.answer("Клієнта не знайдено. Натисніть /start і повторіть спробу.")
         await state.clear()
         return
 
     data = await state.get_data()
-    topic = data["topic"]
+    topic = (data.get("topic") or "").strip()
     text = (message.text or "").strip()
 
     if len(text) < 5:
         await message.answer("Опишіть детальніше (мінімум 5 символів).")
         return
 
-    row = await fetchrow(
-        """
-        INSERT INTO support_requests (client_id, topic, message, status)
-        VALUES ($1, $2, $3, $4)
-        RETURNING request_id
-        """,
-        client_id, topic, text, SupportStatus.OPEN.value
-    )
-    request_id = row["request_id"]
+    request_id = await create_support_request(client_id, topic, text)
 
     await state.clear()
     await message.answer(
         f"✅ Звернення №{request_id} прийнято.\n"
-        f"Чекайте на відповідь менеджера."
+        "Чекайте на відповідь менеджера."
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            await message.bot.send_message(
-                admin_tg,
-                "🆘 Нове звернення підтримки\n"
-                f"Request ID: {request_id}\n"
-                f"Client TG: {tg_id}\n"
-                f"Тема: {topic}\n\n"
-                f"{text}",
-                reply_markup=support_request_kb(request_id)
-            )
-        except Exception:
-            pass
+    await notify_admins_about_support(
+        bot=message.bot,
+        request_id=request_id,
+        client_tg=tg_id,
+        topic=topic,
+        text=text,
+        reply_markup=support_request_kb(request_id),
+    )

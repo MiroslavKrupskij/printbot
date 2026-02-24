@@ -1,13 +1,41 @@
 from aiogram import Router, F
 from aiogram.enums import ContentType
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-from app.db import fetchrow, execute
-from app.texts import status_ua
 from app.enums import OrderStatus, ActorRole, FileRole
-from app.keyboards import payment_actions_kb
+from app.texts import (
+    render_order_card, render_admin_new_order,
+    render_admin_payment_received, render_payment_instructions,
+    render_admin_need_info, render_admin_cancel,
+)
+from app.keyboards import (
+    qty_cancel_kb, my_orders_kb, order_back_kb,
+    add_design_kb, after_payment_prompt_kb, confirmed_actions_kb,
+    admin_need_info_kb, admin_payment_reported_kb,
+    client_created_order_kb, client_empty_orders_kb,
+    order_price_sent_kb, order_need_info_actions_kb,
+    cancel_reason_back_kb, after_cancel_kb,
+    client_menu_only_kb, client_open_order_and_menu_kb,
+    admin_open_order_kb, admin_design_files_kb
+)
+from app.services.auth import get_client_id_by_tg
+from app.services.catalog_service import get_category_name, get_service_name
+from app.services.orders import (
+    get_order_with_client, log_status,
+    create_order, list_client_order_ids, get_client_order,
+    update_status_simple, update_status_confirmed,
+    update_status_canceled, update_status_payment_reported,
+)
+from app.services.files import add_order_file
+from app.services.notify import notify_admins, notify_admins_copy_message
+from app.utils.callbacks import (
+    CallbackParseError,
+    parse_order_start, parse_orders_open,
+    parse_order_confirm, parse_order_need_info, parse_order_continue, parse_order_cancel,
+    parse_design_add, parse_pay_reported,
+)
 
 router = Router()
 
@@ -21,83 +49,26 @@ class PaymentFSM(StatesGroup):
 class NeedInfoFSM(StatesGroup):
     msg = State()
 
-def qty_cancel_kb(category: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"CAT:{category}")],
-    ])
+class DesignFSM(StatesGroup):
+    file = State()
 
-def my_orders_kb(order_ids: list[int]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"Замовлення №{oid}", callback_data=f"ORDERS:OPEN:{oid}")]
-        for oid in order_ids
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def order_back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ До списку", callback_data="ORDERS:MY")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")],
-    ])
-
-def admin_need_info_kb(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Відповісти", callback_data=f"ADMIN:NEED_REPLY:{order_id}")],
-        [InlineKeyboardButton(text=f"📦 Відкрити №{order_id}", callback_data=f"ADMIN:OPEN:{order_id}")],
-    ])
-
-def admin_payment_reported_kb(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Оплату підтверджено", callback_data=f"ADMIN:STATUS:{order_id}:IN_PROGRESS")],
-        [InlineKeyboardButton(text=f"📦 Відкрити №{order_id}", callback_data=f"ADMIN:OPEN:{order_id}")],
-    ])
-
-async def _get_client_id_by_tg(tg_id: int):
-    row = await fetchrow("SELECT client_id FROM clients WHERE telegram_id=$1", tg_id)
-    return row["client_id"] if row else None
-
-async def _get_order_with_client(order_id: int):
-    return await fetchrow(
-        """
-        SELECT o.order_id, o.client_id, o.status, o.price_amount, o.category, o.service, o.quantity,
-               c.telegram_id AS client_tg
-        FROM orders o
-        JOIN clients c ON c.client_id = o.client_id
-        WHERE o.order_id = $1
-        """,
-        order_id
-    )
-
-async def _admin_ids():
-    row = await fetchrow("SELECT array_agg(telegram_id) AS ids FROM admins WHERE is_active=TRUE")
-    return row["ids"] if row and row["ids"] else []
-
-async def _log_status(
-    order_id: int,
-    old_status: str | None,
-    new_status: str,
-    role: str,
-    tg_id: int,
-    comment: str | None
-):
-    await execute(
-        """
-        INSERT INTO order_status_history
-            (order_id, old_status, new_status, changed_by_role, changed_by_telegram_id, comment)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-        order_id, old_status, new_status, role, tg_id, comment
-    )
+class CancelFSM(StatesGroup):
+    reason = State()
 
 @router.callback_query(F.data.startswith("ORDER:START:"))
 async def order_start(cb: CallbackQuery, state: FSMContext):
-    parts = cb.data.split(":")
-    if len(parts) < 4:
+    try:
+        cat_id, svc_id = parse_order_start(cb.data)
+    except CallbackParseError:
         await cb.answer("Помилка даних.", show_alert=True)
         return
 
-    category = parts[2]
-    service = ":".join(parts[3:])
+    category = get_category_name(cat_id)
+    service = get_service_name(cat_id, svc_id)
+
+    if category is None or service is None:
+        await cb.answer("Невірні дані послуги.", show_alert=True)
+        return
 
     await state.clear()
     await state.update_data(category=category, service=service)
@@ -107,7 +78,7 @@ async def order_start(cb: CallbackQuery, state: FSMContext):
         "Оформлення замовлення\n"
         f"Послуга: {category} ➡️ {service}\n\n"
         "Вкажіть кількість:",
-        reply_markup=qty_cancel_kb(category)
+        reply_markup=qty_cancel_kb(cat_id)
     )
     await cb.answer()
 
@@ -142,7 +113,7 @@ async def qty_input(message: Message, state: FSMContext):
 @router.message(OrderFSM.comment)
 async def save_order(message: Message, state: FSMContext):
     tg_id = message.from_user.id
-    client_id = await _get_client_id_by_tg(tg_id)
+    client_id = await get_client_id_by_tg(tg_id)
     if not client_id:
         await message.answer("Клієнта не знайдено. Натисніть /start і повторіть спробу.")
         await state.clear()
@@ -157,17 +128,15 @@ async def save_order(message: Message, state: FSMContext):
     if comment_client == "-":
         comment_client = None
 
-    row = await fetchrow(
-        """
-        INSERT INTO orders (client_id, category, service, quantity, comment_client, status)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING order_id
-        """,
-        client_id, category, service, qty, comment_client, OrderStatus.NEW.value
+    order_id = await create_order(
+        client_id=client_id,
+        category=category,
+        service=service,
+        quantity=qty,
+        comment_client=comment_client,
     )
-    order_id = row["order_id"]
 
-    await _log_status(
+    await log_status(
         order_id=order_id,
         old_status=OrderStatus.NEW.value,
         new_status=OrderStatus.NEW.value,
@@ -179,53 +148,29 @@ async def save_order(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "✅ Замовлення успішно створено!\n"
-        f"ID: {order_id}\n"
-        f"{category} ➡️ {service}\n"
-        f"Кількість: {qty}\n"
-        f"Статус: {status_ua(OrderStatus.NEW.value)}\n\n"
-        "Очікуйте, менеджер розрахує ціну та надішле повідомлення для підтвердження."
+        f"✅ Замовлення №{order_id} створено.\n"
+        "Менеджер надішле вам ціну після розрахунку.",
+        reply_markup=client_created_order_kb()
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            await message.bot.send_message(
-                admin_tg,
-                "📦 Нове замовлення!\n"
-                f"№{order_id}\n"
-                f"{category} ➡️ {service}\n"
-                f"Кількість: {qty}\n"
-                f"Коментар: {comment_client or '-'}\n"
-                f"Статус: {OrderStatus.NEW.value}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text=f"📦 Відкрити №{order_id}", callback_data=f"ADMIN:OPEN:{order_id}")]
-                ])
-            )
-        except Exception:
-            pass
+    await notify_admins(
+        message.bot,
+        render_admin_new_order(order_id, category, service, qty, comment_client),
+        reply_markup=admin_open_order_kb(order_id),
+    )
 
 @router.callback_query(F.data == "ORDERS:MY")
 async def orders_my(cb: CallbackQuery):
-    client_id = await _get_client_id_by_tg(cb.from_user.id)
+    client_id = await get_client_id_by_tg(cb.from_user.id)
     if not client_id:
         await cb.answer("Натисніть /start і поділіться номером телефону.", show_alert=True)
         return
 
-    row = await fetchrow(
-        """
-        SELECT array_agg(order_id ORDER BY created_at DESC) AS ids
-        FROM orders
-        WHERE client_id=$1
-        """,
-        client_id
-    )
-    ids = row["ids"] if row and row["ids"] else []
+    ids = await list_client_order_ids(client_id, limit=10)
     if not ids:
         await cb.message.edit_text(
             "У вас ще немає замовлень.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")]
-            ])
+            reply_markup=client_empty_orders_kb()
         )
         await cb.answer()
         return
@@ -236,56 +181,33 @@ async def orders_my(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ORDERS:OPEN:"))
 async def orders_open(cb: CallbackQuery):
-    order_id = int(cb.data.split(":")[-1])
+    try:
+        order_id = parse_orders_open(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
 
-    client_id = await _get_client_id_by_tg(cb.from_user.id)
+    client_id = await get_client_id_by_tg(cb.from_user.id)
     if not client_id:
         await cb.answer("Натисніть /start і поділіться номером телефону.", show_alert=True)
         return
 
-    order = await fetchrow(
-        """
-        SELECT order_id, category, service, quantity, comment_client, status, price_amount, price_comment
-        FROM orders
-        WHERE order_id=$1 AND client_id=$2
-        """,
-        order_id, client_id
-    )
+    order = await get_client_order(order_id, client_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
     status = order["status"]
-    price = order["price_amount"]
-    price_str = f"{price:.2f} грн" if price is not None else "-"
-
-    text = (
-        f"Замовлення №{order_id}\n"
-        f"Статус: {status_ua(status)} ({status})\n"
-        f"{order['category']} ➡️ {order['service']}\n"
-        f"Кількість: {order['quantity']}\n"
-        f"Коментар клієнта: {order['comment_client'] or '-'}\n"
-        f"Ціна: {price_str}\n"
-        f"Коментар до ціни: {order['price_comment'] or '-'}"
-    )
+    text = render_order_card(order)
 
     if status == OrderStatus.PRICE_SENT.value:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Підтверджую", callback_data=f"ORDER:CONFIRM:{order_id}")],
-            [InlineKeyboardButton(text="❓ Потрібне уточнення", callback_data=f"ORDER:NEED_INFO:{order_id}")],
-            [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"ORDER:CANCEL:{order_id}")],
-            [InlineKeyboardButton(text="⬅️ До списку", callback_data="ORDERS:MY")],
-            [InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")],
-        ])
+        kb = order_price_sent_kb(order_id)
     elif status == OrderStatus.CONFIRMED.value:
-        kb = payment_actions_kb(order_id)
+        kb = confirmed_actions_kb(order_id)
     elif status == OrderStatus.NEED_INFO.value:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Продовжити", callback_data=f"ORDER:CONTINUE:{order_id}")],
-            [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"ORDER:CANCEL:{order_id}")],
-            [InlineKeyboardButton(text="⬅️ До списку", callback_data="ORDERS:MY")],
-            [InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")],
-        ])
+        kb = order_need_info_actions_kb(order_id)
+    elif status in {OrderStatus.PAYMENT_REPORTED.value, OrderStatus.IN_PROGRESS.value, OrderStatus.READY.value}:
+        kb = add_design_kb(order_id)
     else:
         kb = order_back_kb()
 
@@ -294,8 +216,13 @@ async def orders_open(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ORDER:CONFIRM:"))
 async def order_confirm(cb: CallbackQuery):
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order_with_client(order_id)
+    try:
+        order_id = parse_order_confirm(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
+
+    order = await get_order_with_client(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
@@ -307,35 +234,32 @@ async def order_confirm(cb: CallbackQuery):
     old_status = order["status"]
     new_status = OrderStatus.CONFIRMED.value
 
-    await execute(
-        "UPDATE orders SET status=$2, confirmed_at=now() WHERE order_id=$1",
-        order_id, new_status
-    )
-    await _log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client confirmed price")
-
-    price_amount = order["price_amount"]
-    price_str = f"{price_amount:.2f} грн" if price_amount is not None else "-"
+    await update_status_confirmed(order_id, new_status)
+    await log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client confirmed price")
 
     await cb.message.edit_text(
-        "✅ Дякую! Замовлення підтверджено.\n"
-        f"Замовлення №{order_id}\n"
-        f"Ціна: {price_str}\n\n"
-        "Після оплати натисніть «Я оплатив(-ла)» і завантажте квитанцію.",
-        reply_markup=payment_actions_kb(order_id)
+        render_payment_instructions(order_id, order.get("price_amount")),
+        reply_markup=confirmed_actions_kb(order_id),
+        parse_mode="HTML",
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            await cb.bot.send_message(admin_tg, f"✅ Клієнт підтвердив ціну по замовленню №{order_id}.")
-        except Exception:
-            pass
+    await notify_admins(
+        cb.bot,
+        f"✅ Клієнт підтвердив ціну по замовленню №{order_id}.",
+        reply_markup=admin_open_order_kb(order_id),
+    )
 
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ORDER:NEED_INFO:"))
 async def order_need_info(cb: CallbackQuery, state: FSMContext):
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order_with_client(order_id)
+    try:
+        order_id = parse_order_need_info(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
+
+    order = await get_order_with_client(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
@@ -343,8 +267,8 @@ async def order_need_info(cb: CallbackQuery, state: FSMContext):
     old_status = order["status"]
     new_status = OrderStatus.NEED_INFO.value
 
-    await execute("UPDATE orders SET status=$2 WHERE order_id=$1", order_id, new_status)
-    await _log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client needs info")
+    await update_status_simple(order_id, new_status)
+    await log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client needs info")
 
     await state.clear()
     await state.update_data(need_info_order_id=order_id)
@@ -370,7 +294,7 @@ async def need_info_message(message: Message, state: FSMContext):
         await message.answer("Текст уточнення занадто короткий. Спробуйте ще раз.")
         return
 
-    await _log_status(
+    await log_status(
         order_id=order_id,
         old_status=None,
         new_status=OrderStatus.NEED_INFO.value,
@@ -379,27 +303,25 @@ async def need_info_message(message: Message, state: FSMContext):
         comment=f"Уточнення клієнта: {text}"
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            await message.bot.send_message(
-                admin_tg,
-                "❓ Уточнення від клієнта\n"
-                f"Замовлення №{order_id}\n"
-                f"Client TG: {message.from_user.id}\n\n"
-                f"{text}",
-                reply_markup=admin_need_info_kb(order_id)
-            )
-        except Exception:
-            pass
+    await notify_admins(
+        message.bot,
+        render_admin_need_info(order_id, message.from_user.id, text),
+        reply_markup=admin_need_info_kb(order_id),
+    )
 
     await state.clear()
     await message.answer("✅ Дякуємо! Ми передали уточнення менеджеру. Очікуйте на відповідь.")
 
+
 @router.callback_query(F.data.startswith("ORDER:CONTINUE:"))
 async def order_continue(cb: CallbackQuery):
-    order_id = int(cb.data.split(":")[-1])
+    try:
+        order_id = parse_order_continue(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
 
-    order = await _get_order_with_client(order_id)
+    order = await get_order_with_client(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
@@ -412,23 +334,28 @@ async def order_continue(cb: CallbackQuery):
     old_status = order["status"]
     next_status = OrderStatus.PRICE_SENT.value if order["price_amount"] is not None else OrderStatus.NEW.value
 
-    await execute("UPDATE orders SET status=$2 WHERE order_id=$1", order_id, next_status)
-    await _log_status(
+    await update_status_simple(order_id, next_status)
+    await log_status(
         order_id=order_id,
         old_status=old_status,
         new_status=next_status,
         role=ActorRole.CLIENT.value,
         tg_id=cb.from_user.id,
-        comment="client продолжив після NEED_INFO"
+        comment="client continued after NEED_INFO"
     )
 
     await orders_open(cb)
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ORDER:CANCEL:"))
-async def order_cancel(cb: CallbackQuery):
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order_with_client(order_id)
+async def order_cancel(cb: CallbackQuery, state: FSMContext):
+    try:
+        order_id = parse_order_cancel(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
+
+    order = await get_order_with_client(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
@@ -437,46 +364,211 @@ async def order_cancel(cb: CallbackQuery):
         await cb.answer("Вже скасовано.", show_alert=True)
         return
 
+    need_reason_statuses = {
+        OrderStatus.PAYMENT_REPORTED.value,
+        OrderStatus.IN_PROGRESS.value,
+        OrderStatus.READY.value,
+        OrderStatus.DONE.value,
+    }
+    if order["status"] in need_reason_statuses:
+        await state.clear()
+        await state.update_data(cancel_order_id=order_id)
+        await state.set_state(CancelFSM.reason)
+
+        await cb.message.edit_text(
+            f"❌ Скасування замовлення №{order_id}\n\n"
+            "Це замовлення вже після оплати/в роботі.\n"
+            "Будь ласка, напишіть причину скасування одним повідомленням:",
+            reply_markup=cancel_reason_back_kb(order_id)
+        )
+        await cb.answer()
+        return
+
     old_status = order["status"]
     new_status = OrderStatus.CANCELED.value
 
-    await execute(
-        "UPDATE orders SET status=$2, canceled_at=now(), cancel_reason=$3 WHERE order_id=$1",
-        order_id, new_status, "Скасовано клієнтом"
-    )
-    await _log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client canceled")
+    await update_status_canceled(order_id, new_status, "Скасовано клієнтом")
+    await log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, cb.from_user.id, "client canceled")
 
     await cb.message.edit_text(
         f"❌ Замовлення №{order_id} скасовано.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Меню", callback_data="CLIENT:MENU")]
-        ])
+        reply_markup=client_menu_only_kb()
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            await cb.bot.send_message(
-                admin_tg,
-                f"❌ Клієнт скасував замовлення №{order_id} (було {status_ua(str(old_status))})."
-            )
-        except Exception:
-            pass
+    await notify_admins(
+        cb.bot,
+        render_admin_cancel(order_id, old_status, "Скасовано клієнтом"),
+        reply_markup=admin_open_order_kb(order_id),
+    )
 
     await cb.answer()
 
-@router.callback_query(F.data.startswith("PAY:REPORTED:"))
-async def pay_reported(cb: CallbackQuery, state: FSMContext):
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order_with_client(order_id)
+@router.message(CancelFSM.reason)
+async def cancel_reason_message(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(data.get("cancel_order_id") or 0)
+    if not order_id:
+        await message.answer("Помилка. Спробуйте ще раз через список замовлень.")
+        await state.clear()
+        return
+
+    reason = (message.text or "").strip()
+    if len(reason) < 3:
+        await message.answer("Причина занадто коротка. Напишіть, будь ласка, детальніше.")
+        return
+
+    order = await get_order_with_client(order_id)
+    if not order:
+        await message.answer("Замовлення не знайдено.")
+        await state.clear()
+        return
+
+    if order["status"] == OrderStatus.CANCELED.value:
+        await message.answer("Це замовлення вже скасовано.")
+        await state.clear()
+        return
+
+    old_status = order["status"]
+    new_status = OrderStatus.CANCELED.value
+
+    await update_status_canceled(order_id, new_status, reason)
+    await log_status(
+        order_id,
+        old_status,
+        new_status,
+        ActorRole.CLIENT.value,
+        message.from_user.id,
+        f"client canceled (reason): {reason}"
+    )
+
+    await state.clear()
+
+    await message.answer(
+        f"❌ Замовлення №{order_id} скасовано.\n"
+        f"Причина: {reason}",
+        reply_markup=after_cancel_kb()
+    )
+
+    await notify_admins(
+        message.bot,
+        render_admin_cancel(order_id, old_status, reason),
+        reply_markup=admin_open_order_kb(order_id),
+    )
+
+@router.callback_query(F.data.startswith("DESIGN:ADD:"))
+async def design_add(cb: CallbackQuery, state: FSMContext):
+    try:
+        order_id = parse_design_add(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
+
+    order = await get_order_with_client(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
-    if order["status"] not in (
-        OrderStatus.CONFIRMED.value,
+    allowed_statuses = {
         OrderStatus.PAYMENT_REPORTED.value,
-        OrderStatus.IN_PROGRESS.value
-    ):
+        OrderStatus.IN_PROGRESS.value,
+        OrderStatus.READY.value,
+    }
+    if order["status"] not in allowed_statuses:
+        await cb.answer("Дизайн можна додати лише після оплати (після завантаження квитанції).", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(order_id=order_id)
+    await state.set_state(DesignFSM.file)
+
+    await cb.message.edit_text(
+        f"🎨 Надішліть дизайн-файл для замовлення №{order_id}.\n"
+        "Підійде фото або документ (PDF/AI/PSD/CDR тощо)."
+    )
+    await cb.answer()
+
+@router.message(DesignFSM.file, F.content_type.in_({ContentType.PHOTO, ContentType.DOCUMENT}))
+async def design_upload(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(data["order_id"])
+
+    order = await get_order_with_client(order_id)
+    if not order:
+        await message.answer("Замовлення не знайдено.")
+        await state.clear()
+        return
+
+    tg_file_id = None
+    file_name = None
+    mime_type = None
+
+    if message.photo:
+        tg_file_id = message.photo[-1].file_id
+        file_name = "design.jpg"
+        mime_type = "image/jpeg"
+    elif message.document:
+        tg_file_id = message.document.file_id
+        file_name = message.document.file_name
+        mime_type = message.document.mime_type
+
+    if not tg_file_id:
+        await message.answer("Не вдалося отримати файл. Спробуйте ще раз.")
+        return
+
+    await add_order_file(
+        order_id=order_id,
+        role=FileRole.DESIGN.value,
+        tg_file_id=tg_file_id,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+
+    await log_status(
+        order_id,
+        order["status"],
+        order["status"],
+        ActorRole.CLIENT.value,
+        message.from_user.id,
+        "design file uploaded"
+    )
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Дизайн-файл для замовлення №{order_id} отримано.\n"
+        "Менеджер перевірить файл. За потреби ми напишемо вам.",
+        reply_markup=client_open_order_and_menu_kb(order_id)
+    )
+
+    await notify_admins(
+        message.bot,
+        f"🎨 Отримано дизайн-файл для замовлення №{order_id}.",
+        reply_markup=admin_design_files_kb(order_id),
+    )
+    await notify_admins_copy_message(
+        message.bot,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+@router.message(DesignFSM.file)
+async def design_wrong_content(message: Message):
+    await message.answer("Будь-ласка, надішліть фото або документ з дизайн-файлом.")
+
+@router.callback_query(F.data.startswith("PAY:REPORTED:"))
+async def pay_reported(cb: CallbackQuery, state: FSMContext):
+    try:
+        order_id = parse_pay_reported(cb.data)
+    except CallbackParseError:
+        await cb.answer("Помилка даних.", show_alert=True)
+        return
+
+    order = await get_order_with_client(order_id)
+    if not order:
+        await cb.answer("Замовлення не знайдено.", show_alert=True)
+        return
+
+    if order["status"] not in (OrderStatus.CONFIRMED.value, OrderStatus.PAYMENT_REPORTED.value):
         await cb.answer("Цей крок доступний після підтвердження ціни.", show_alert=True)
         return
 
@@ -494,7 +586,7 @@ async def payment_proof(message: Message, state: FSMContext):
     data = await state.get_data()
     order_id = int(data["order_id"])
 
-    order = await _get_order_with_client(order_id)
+    order = await get_order_with_client(order_id)
     if not order:
         await message.answer("Замовлення не знайдено.")
         await state.clear()
@@ -506,7 +598,7 @@ async def payment_proof(message: Message, state: FSMContext):
 
     if message.photo:
         tg_file_id = message.photo[-1].file_id
-        file_name = "photo.jpg"
+        file_name = "payment.jpg"
         mime_type = "image/jpeg"
     elif message.document:
         tg_file_id = message.document.file_id
@@ -517,54 +609,48 @@ async def payment_proof(message: Message, state: FSMContext):
         await message.answer("Не вдалося отримати файл. Спробуйте ще раз.")
         return
 
-    await execute(
-        """
-        INSERT INTO order_files(order_id, role, tg_file_id, file_name, mime_type)
-        VALUES ($1, $2, $3, $4, $5)
-        """,
-        order_id, FileRole.PAYMENT_PROOF.value, tg_file_id, file_name, mime_type
+    await add_order_file(
+        order_id=order_id,
+        role=FileRole.PAYMENT_PROOF.value,
+        tg_file_id=tg_file_id,
+        file_name=file_name,
+        mime_type=mime_type,
     )
 
     if order["status"] != OrderStatus.PAYMENT_REPORTED.value:
         old_status = order["status"]
         new_status = OrderStatus.PAYMENT_REPORTED.value
 
-        await execute(
-            "UPDATE orders SET status=$2, payment_reported_at=now() WHERE order_id=$1",
-            order_id, new_status
+        await update_status_payment_reported(order_id, new_status)
+        await log_status(
+            order_id,
+            old_status,
+            new_status,
+            ActorRole.CLIENT.value,
+            message.from_user.id,
+            "payment proof uploaded"
         )
-        await _log_status(order_id, old_status, new_status, ActorRole.CLIENT.value, message.from_user.id, "payment proof uploaded")
 
     await state.clear()
 
     await message.answer(
         f"✅ Квитанцію з оплатою замовлення №{order_id} отримано.\n"
-        "Адміністратор перевірить оплату та оновить статус замовлення. Очікуйте на повідомлення."
+        "Адміністратор перевірить оплату та оновить статус замовлення.\n\n"
+        "🎨 Після оплати ви можете надіслати дизайн-файл:",
+        reply_markup=after_payment_prompt_kb(order_id)
     )
 
-    for admin_tg in await _admin_ids():
-        try:
-            price = order["price_amount"]
-            price_str = f"{price:.2f} грн" if price is not None else "-"
+    await notify_admins(
+        message.bot,
+        render_admin_payment_received(order, order_id),
+        reply_markup=admin_payment_reported_kb(order_id),
+    )
 
-            await message.bot.send_message(
-                admin_tg,
-                "📎 Квитанція з оплатою отримана\n"
-                f"Замовлення №{order_id}\n"
-                f"{order['category']} ➡️ {order['service']}\n"
-                f"Кількість: {order['quantity']}\n"
-                f"Ціна: {price_str}\n"
-                f"Статус: {OrderStatus.PAYMENT_REPORTED.value}",
-                reply_markup=admin_payment_reported_kb(order_id)
-            )
-
-            await message.bot.copy_message(
-                chat_id=admin_tg,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-        except Exception:
-            pass
+    await notify_admins_copy_message(
+        message.bot,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
 
 @router.message(PaymentFSM.proof)
 async def payment_wrong_content(message: Message):

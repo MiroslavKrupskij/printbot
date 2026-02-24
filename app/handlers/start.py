@@ -1,30 +1,25 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, CallbackQuery
 
-from app.db import fetchrow, execute
-from app.keyboards import phone_request_kb, persistent_menu_kb
-from app.handlers.admin import admin_menu_kb, _is_admin
+from app.keyboards import (
+    phone_request_kb, persistent_menu_kb,
+    main_menu_kb, back_to_menu_kb,
+)
+from app.handlers.admin import admin_menu_kb
+from app.services.auth import is_admin
+from app.services.clients import get_client_by_tg_id, upsert_client_from_contact
+from app.texts import (
+    contacts_text_md, help_text_md, location_text_md,
+    ARTEL_LAT, ARTEL_LON,
+)
 
 router = Router()
-
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Каталог послуг", callback_data="CATALOG:OPEN")],
-        [InlineKeyboardButton(text="📋 Мої замовлення", callback_data="ORDERS:MY")],
-        [InlineKeyboardButton(text="🆘 Підтримка", callback_data="SUPPORT:OPEN")],
-    ])
-
-async def _get_client_by_tg_id(tg_id: int):
-    return await fetchrow(
-        "SELECT client_id, telegram_id, phone FROM clients WHERE telegram_id=$1",
-        tg_id
-    )
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     tg_id = message.from_user.id
-    client = await _get_client_by_tg_id(tg_id)
+    client = await get_client_by_tg_id(tg_id)
 
     if client is None or not client["phone"]:
         await message.answer(
@@ -33,23 +28,17 @@ async def cmd_start(message: Message):
         )
         return
 
-    if await _is_admin(tg_id):
-        await message.answer(
-            "🔸 Адмін-меню:",
-            reply_markup=persistent_menu_kb()
-        )
+    if await is_admin(tg_id):
+        await message.answer("🔸 Адмін-меню:", reply_markup=persistent_menu_kb())
         await message.answer("🔸 Адмін-меню:", reply_markup=admin_menu_kb())
     else:
-        await message.answer(
-            "З поверненням! 👋",
-            reply_markup=persistent_menu_kb()
-        )
+        await message.answer("З поверненням! 👋", reply_markup=persistent_menu_kb())
         await message.answer("🔸 Меню користувача:", reply_markup=main_menu_kb())
 
 @router.message(F.contact)
 async def got_contact(message: Message):
     if not message.contact or message.contact.user_id != message.from_user.id:
-        await message.answer("Будь-ласка, надішліть свій номер телефону.")
+        await message.answer("Будь ласка, надішліть свій номер телефону кнопкою нижче.")
         return
 
     tg_id = message.from_user.id
@@ -57,42 +46,25 @@ async def got_contact(message: Message):
     full_name = (message.from_user.full_name or "").strip()
     phone = message.contact.phone_number
 
-    client = await _get_client_by_tg_id(tg_id)
-
-    if client is None:
-        await execute(
-            """
-            INSERT INTO clients(telegram_id, username, full_name, phone)
-            VALUES ($1, $2, $3, $4)
-            """,
-            tg_id, username, full_name, phone
-        )
-    else:
-        await execute(
-            """
-            UPDATE clients
-            SET username=$2, full_name=$3, phone=$4
-            WHERE telegram_id=$1
-            """,
-            tg_id, username, full_name, phone
-        )
-
-    await message.answer(
-        "Дякую! Номер збережено ✅",
-        reply_markup=persistent_menu_kb()
+    await upsert_client_from_contact(
+        tg_id=tg_id,
+        username=username,
+        full_name=full_name,
+        phone=phone,
     )
+
+    await message.answer("Дякую! Номер збережено ✅", reply_markup=persistent_menu_kb())
     await message.answer("🔸 Меню користувача:", reply_markup=main_menu_kb())
 
 @router.message(F.text == "☰ Меню")
 async def open_menu(message: Message):
     tg_id = message.from_user.id
 
-    if await _is_admin(tg_id):
+    if await is_admin(tg_id):
         await message.answer("🔸 Адмін-меню:", reply_markup=admin_menu_kb())
         return
 
-    client = await _get_client_by_tg_id(tg_id)
-
+    client = await get_client_by_tg_id(tg_id)
     if client is None or not client["phone"]:
         await message.answer(
             "Для користування ботом поділіться номером телефону.",
@@ -106,3 +78,31 @@ async def open_menu(message: Message):
 async def client_menu_cb(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text("🔸 Меню користувача:", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "CONTACTS:OPEN")
+async def contacts_open(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.edit_text(
+        contacts_text_md(),
+        reply_markup=back_to_menu_kb(),
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(F.data == "LOCATION:OPEN")
+async def location_open(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.edit_text(
+        location_text_md(),
+        reply_markup=back_to_menu_kb(),
+        parse_mode="Markdown"
+    )
+    await cb.message.answer_location(latitude=ARTEL_LAT, longitude=ARTEL_LON)
+
+@router.callback_query(F.data == "HELP:OPEN")
+async def help_open(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.edit_text(
+        help_text_md(),
+        reply_markup=back_to_menu_kb(),
+        parse_mode="Markdown"
+    )

@@ -1,16 +1,48 @@
 from __future__ import annotations
 
-import json
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-from app.db import fetchrow, execute
-from app.texts import status_ua
+from app.texts import (
+    status_ua, format_price, render_order_card,
+    render_price_sent_to_client, render_admin_client_info, render_admin_support_request
+)
 from app.enums import OrderStatus, ActorRole
-from app.keyboards import price_confirm_kb
+from app.keyboards import (
+    admin_menu_kb, orders_list_kb, admin_back_kb,
+    order_actions_kb, support_list_kb,
+    support_actions_kb, price_confirm_kb,
+    admin_after_message_kb, admin_client_info_kb,
+)
+from app.services.auth import is_admin
+from app.services.clients import get_client_by_id
+from app.services.orders import (
+    get_admin_order, log_status, list_order_ids_by_status,
+    set_price_and_mark_price_sent,
+)
+from app.services.admin_files import send_order_files_to_admin_chat
+from app.services.admin_messaging import send_manager_message_to_client, close_need_info
+from app.services.admin_status import admin_change_order_status
+from app.services.support_service import (
+    close_support_with_reply,
+    close_support_without_reply,
+    list_open_support_request_ids,
+    get_support_request_with_client,
+    get_support_request,
+)
+from app.utils.callbacks import (
+    CallbackParseError,
+    parse_admin_list, parse_admin_open,
+    parse_admin_client, parse_admin_client_msg,
+    parse_admin_need_close, parse_admin_need_reply,
+    parse_admin_set_price, parse_admin_status,
+    parse_admin_files, parse_admin_support_action,
+    cb_admin_menu, cb_admin_client, cb_admin_support_open,
+)
 
 router = Router()
 
@@ -19,281 +51,39 @@ class AdminFSM(StatesGroup):
     set_price_comment = State()
     support_reply = State()
     need_info_reply = State()
-
-async def _is_admin(tg_id: int) -> bool:
-    row = await fetchrow(
-        "SELECT admin_id FROM admins WHERE telegram_id=$1 AND is_active=TRUE",
-        tg_id,
-    )
-    return row is not None
-
-async def _log_status(
-    order_id: int,
-    old_status: str | None,
-    new_status: str,
-    tg_id: int,
-    comment: str | None,
-):
-    await execute(
-        """
-        INSERT INTO order_status_history
-            (order_id, old_status, new_status, changed_by_role, changed_by_telegram_id, comment)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-        order_id,
-        old_status,
-        new_status,
-        ActorRole.ADMIN.value,
-        tg_id,
-        comment,
-    )
-
-def admin_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Нові замовлення", callback_data="ADMIN:LIST:NEW")],
-            [InlineKeyboardButton(text="❓ Потребують уточнення", callback_data="ADMIN:LIST:NEED_INFO")],
-            [InlineKeyboardButton(text="💳 Оплачені замовлення", callback_data="ADMIN:LIST:PAYMENT_REPORTED")],
-            [InlineKeyboardButton(text="🛠 Замовлення, які виконуються", callback_data="ADMIN:LIST:IN_PROGRESS")],
-            [InlineKeyboardButton(text="✅ Готові замовлення", callback_data="ADMIN:LIST:READY")],
-            [InlineKeyboardButton(text="🆘 Заявки в підтримку", callback_data="ADMIN:SUPPORT:LIST")],
-        ]
-    )
-
-def orders_list_kb(order_ids: list[int], back_to_menu: bool = True) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"Замовлення №{oid}", callback_data=f"ADMIN:OPEN:{oid}")]
-        for oid in order_ids
-    ]
-    if back_to_menu:
-        rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="ADMIN:MENU")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def back_kb(target: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]])
-
-def order_actions_kb(order_id: int, status: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-
-    if status == OrderStatus.NEW.value:
-        rows.append([InlineKeyboardButton(text="💰 Встановити ціну", callback_data=f"ADMIN:SET_PRICE:{order_id}")])
-
-    if status in {OrderStatus.PAYMENT_REPORTED.value, OrderStatus.IN_PROGRESS.value}:
-        rows.append([InlineKeyboardButton(text="📎 Показати файли", callback_data=f"ADMIN:FILES:{order_id}")])
-
-    if status == OrderStatus.NEED_INFO.value:
-        rows.append([InlineKeyboardButton(text="💬 Відповісти клієнту", callback_data=f"ADMIN:NEED_REPLY:{order_id}")])
-        rows.append([InlineKeyboardButton(text="✅ Уточнення надано", callback_data=f"ADMIN:NEED_CLOSE:{order_id}")])
-
-    if status == OrderStatus.PAYMENT_REPORTED.value:
-        rows.append([InlineKeyboardButton(text="✅ Оплату підтверджено", callback_data=f"ADMIN:STATUS:{order_id}:IN_PROGRESS")])
-        rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"ADMIN:STATUS:{order_id}:CANCELED")])
-
-    if status == OrderStatus.IN_PROGRESS.value:
-        rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"ADMIN:STATUS:{order_id}:READY")])
-        rows.append([InlineKeyboardButton(text="🏁 Завершити", callback_data=f"ADMIN:STATUS:{order_id}:DONE")])
-        rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"ADMIN:STATUS:{order_id}:CANCELED")])
-
-    if status == OrderStatus.READY.value:
-        rows.append([InlineKeyboardButton(text="🏁 Завершити", callback_data=f"ADMIN:STATUS:{order_id}:DONE")])
-        rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"ADMIN:STATUS:{order_id}:CANCELED")])
-
-    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="ADMIN:MENU")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def support_list_kb(request_ids: list[int]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"Звернення №{rid}", callback_data=f"ADMIN:SUPPORT:OPEN:{rid}")]
-        for rid in request_ids
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="ADMIN:MENU")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def support_actions_kb(request_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✍️ Відповісти", callback_data=f"ADMIN:SUPPORT:REPLY:{request_id}")],
-            [InlineKeyboardButton(text="✅ Закрити", callback_data=f"ADMIN:SUPPORT:CLOSE:{request_id}")],
-            [InlineKeyboardButton(text="⬅️ До списку", callback_data="ADMIN:SUPPORT:LIST")],
-        ]
-    )
-
-async def _get_order(order_id: int):
-    return await fetchrow(
-        """
-        SELECT o.order_id, o.client_id, o.category, o.service, o.quantity, o.comment_client,
-               o.status, o.price_amount, o.price_comment,
-               c.telegram_id AS client_tg
-        FROM orders o
-        JOIN clients c ON c.client_id=o.client_id
-        WHERE o.order_id=$1
-        """,
-        order_id,
-    )
-
-def _order_text(order: dict) -> str:
-    order_id = order["order_id"]
-    price = order["price_amount"]
-    price_str = f"{price:.2f} грн" if price is not None else "-"
-
-    status_code = order["status"]
-    status_str = f"{status_ua(status_code)} ({status_code})"
-
-    return (
-        f"Замовлення №{order_id}\n"
-        f"Статус: {status_str}\n"
-        f"{order['category']} ➡️ {order['service']}\n"
-        f"Кількість: {order['quantity']}\n"
-        f"Коментар клієнта: {order['comment_client'] or '-'}\n"
-        f"Ціна: {price_str}\n"
-        f"Коментар до ціни: {order['price_comment'] or '-'}\n"
-    )
-
-_STATUS_TO_TIMEFIELD = {
-    OrderStatus.IN_PROGRESS.value: "in_progress_at",
-    OrderStatus.READY.value: "ready_at",
-    OrderStatus.DONE.value: "done_at",
-    OrderStatus.CANCELED.value: "canceled_at",
-}
-
-async def _send_order_files(target: Message, order_id: int):
-    row = await fetchrow(
-        """
-        SELECT json_agg(t ORDER BY t.created_at ASC) AS items
-        FROM (
-            SELECT role, tg_file_id, file_name, mime_type, created_at
-            FROM order_files
-            WHERE order_id=$1
-            ORDER BY created_at ASC
-        ) t
-        """,
-        order_id,
-    )
-
-    items = row["items"] if row and row["items"] else []
-
-    if isinstance(items, str):
-        try:
-            items = json.loads(items)
-        except Exception:
-            items = []
-
-    if not isinstance(items, list):
-        items = []
-
-    if not items:
-        await target.answer(f"Файлів для замовлення №{order_id} немає.")
-        return
-
-    await target.answer(f"📎 Файли для замовлення №{order_id}:")
-
-    for it in items:
-        if isinstance(it, str):
-            try:
-                it = json.loads(it)
-            except Exception:
-                continue
-        if not isinstance(it, dict):
-            continue
-
-        role = it.get("role")
-        tg_file_id = it.get("tg_file_id")
-        mime = (it.get("mime_type") or "").lower()
-        name = it.get("file_name") or "file"
-        caption = f"{role} • {name}"
-
-        try:
-            if mime.startswith("image/"):
-                await target.bot.send_photo(chat_id=target.chat.id, photo=tg_file_id, caption=caption)
-            else:
-                await target.bot.send_document(chat_id=target.chat.id, document=tg_file_id, caption=caption)
-        except Exception:
-            try:
-                await target.bot.send_document(chat_id=target.chat.id, document=tg_file_id, caption=caption)
-            except Exception:
-                pass
-
-async def _close_support_with_reply(bot, request_id: int, reply_text: str) -> str:
-    row = await fetchrow(
-        """
-        SELECT sr.request_id, sr.status, sr.topic,
-               c.telegram_id AS client_tg
-        FROM support_requests sr
-        JOIN clients c ON c.client_id = sr.client_id
-        WHERE sr.request_id=$1
-        """,
-        request_id,
-    )
-    if not row:
-        return f"Звернення №{request_id} не знайдено."
-
-    if row["status"] != "OPEN":
-        return f"Звернення №{request_id} вже закрите."
-
-    client_tg = int(row["client_tg"])
-
-    await bot.send_message(
-        client_tg,
-        "📩 Відповідь підтримки\n"
-        f"Звернення №{request_id}\n"
-        f"Тема: {row['topic']}\n\n"
-        f"{reply_text}",
-    )
-
-    await execute(
-        "UPDATE support_requests SET status='CLOSED', closed_at=now() WHERE request_id=$1",
-        request_id,
-    )
-    return f"✅ Відповідь на звернення №{request_id} надіслано. Звернення закрито."
-
-async def _close_support_without_reply(request_id: int) -> str:
-    row = await fetchrow(
-        "SELECT request_id, status FROM support_requests WHERE request_id=$1",
-        request_id,
-    )
-    if not row:
-        return "Звернення не знайдено."
-    if row["status"] != "OPEN":
-        return "Воно вже закрите."
-
-    await execute(
-        "UPDATE support_requests SET status='CLOSED', closed_at=now() WHERE request_id=$1",
-        request_id,
-    )
-    return f"✅ Звернення №{request_id} закрито."
+    client_message = State()
 
 @router.message(Command("admin"))
 async def admin_cmd(message: Message):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         return
-    await message.answer("Адмін-меню:", reply_markup=admin_menu_kb())
+
+    await message.answer("🔸 Адмін-меню:", reply_markup=admin_menu_kb())
 
 @router.callback_query(F.data == "ADMIN:MENU")
 async def admin_menu(cb: CallbackQuery, state: FSMContext):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
+
     await state.clear()
-    await cb.message.edit_text("Адмін-меню:", reply_markup=admin_menu_kb())
+    await cb.message.edit_text("🔸 Адмін-меню:", reply_markup=admin_menu_kb())
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ADMIN:LIST:"))
 async def admin_list(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    status = cb.data.split(":")[-1]
-    row = await fetchrow(
-        """
-        SELECT array_agg(order_id ORDER BY created_at DESC) AS ids
-        FROM orders
-        WHERE status=$1
-        """,
-        status,
-    )
-    ids = row["ids"] if row and row["ids"] else []
+    try:
+        status = parse_admin_list(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    ids = await list_order_ids_by_status(status)
     if not ids:
         await cb.message.edit_text(
             f"Замовлень зі статусом {status_ua(status)} ({status}) немає ✅",
@@ -302,159 +92,236 @@ async def admin_list(cb: CallbackQuery):
         await cb.answer()
         return
 
-    await cb.message.edit_text(f"Оберіть замовлення ({status_ua(status)}):", reply_markup=orders_list_kb(ids))
+    await cb.message.edit_text(
+        f"Оберіть замовлення ({status_ua(status)}):",
+        reply_markup=orders_list_kb(ids)
+    )
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ADMIN:OPEN:"))
 async def admin_open_order(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order(order_id)
+    try:
+        order_id = parse_admin_open(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    order = await get_admin_order(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
-    await cb.message.edit_text(_order_text(order), reply_markup=order_actions_kb(order_id, order["status"]))
+    await cb.message.edit_text(
+        render_order_card(order),
+        reply_markup=order_actions_kb(order_id, order["status"])
+    )
     await cb.answer()
 
-@router.callback_query(F.data.startswith("ADMIN:NEED_CLOSE:"))
-async def admin_need_close(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+@router.callback_query(F.data.startswith("ADMIN:CLIENT:"))
+async def admin_client_info(cb: CallbackQuery, state: FSMContext):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order(order_id)
+    await state.clear()
+
+    try:
+        order_id = parse_admin_client(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    order = await get_admin_order(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
-    if order["status"] != OrderStatus.NEED_INFO.value:
-        await cb.answer("Це замовлення вже не у статусі NEED_INFO.", show_alert=True)
+    client = await get_client_by_id(int(order["client_id"]))
+    if not client:
+        await cb.answer("Клієнта не знайдено.", show_alert=True)
         return
 
-    old_status = order["status"]
-    next_status = OrderStatus.PRICE_SENT.value if order["price_amount"] is not None else OrderStatus.NEW.value
+    text = render_admin_client_info(client)
+    kb = admin_client_info_kb(order_id)
 
-    await execute("UPDATE orders SET status=$2 WHERE order_id=$1", order_id, next_status)
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await cb.answer()
 
-    await _log_status(
-        order_id=order_id,
-        old_status=old_status,
-        new_status=next_status,
-        tg_id=cb.from_user.id,
-        comment="closed NEED_INFO",
-    )
-
-    client_tg = int(order["client_tg"])
-    try:
-        await cb.bot.send_message(
-            client_tg,
-            f"ℹ️ Статус замовлення №{order_id} оновлено: {status_ua(next_status)}",
-        )
-    except Exception:
-        pass
-
-    await cb.answer("Уточнення закрито ✅", show_alert=True)
-
-    refreshed = await _get_order(order_id)
-    await cb.message.edit_text(_order_text(refreshed), reply_markup=order_actions_kb(order_id, refreshed["status"]))
-
-@router.callback_query(F.data.startswith("ADMIN:NEED_REPLY:"))
-async def admin_need_reply_start(cb: CallbackQuery, state: FSMContext):
-    if not await _is_admin(cb.from_user.id):
+@router.callback_query(F.data.startswith("ADMIN:CLIENT_MSG:"))
+async def admin_client_message_start(cb: CallbackQuery, state: FSMContext):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order(order_id)
+    try:
+        order_id = parse_admin_client_msg(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    order = await get_admin_order(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
     await state.clear()
-    await state.update_data(need_reply_order_id=order_id)
-    await state.set_state(AdminFSM.need_info_reply)
+    await state.update_data(client_msg_order_id=order_id)
+    await state.set_state(AdminFSM.client_message)
 
-    await cb.message.answer(f"✍️ Введіть відповідь клієнту по замовленню №{order_id}:")
+    await cb.message.edit_text(
+        f"✉️ Повідомлення клієнту • замовлення №{order_id}\n\n"
+        "Надішліть текст одним повідомленням:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=cb_admin_client(order_id))],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data=cb_admin_menu())],
+        ])
+    )
     await cb.answer()
 
-@router.message(AdminFSM.need_info_reply)
-async def admin_need_reply_send(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
+@router.message(AdminFSM.client_message)
+async def admin_client_message_send(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         await state.clear()
         return
 
     data = await state.get_data()
-    order_id = int(data.get("need_reply_order_id") or 0)
-    text = (message.text or "").strip()
-
+    order_id = int(data.get("client_msg_order_id") or 0)
     if not order_id:
-        await message.answer("Не вдалося визначити замовлення. Спробуйте ще раз.")
+        await message.answer("Помилка стану. Поверніться в адмін-меню і спробуйте ще раз.")
         await state.clear()
         return
 
+    text = (message.text or "").strip()
+    if len(text) < 2:
+        await message.answer("Текст занадто короткий. Спробуйте ще раз.")
+        return
+
+    ok, msg = await send_manager_message_to_client(
+        bot=message.bot,
+        order_id=order_id,
+        admin_tg_id=message.from_user.id,
+        text=text,
+    )
+
+    if not ok:
+        await message.answer(msg)
+        await state.clear()
+        return
+
+    await state.clear()
+
+    await message.answer(
+        msg,
+        reply_markup=admin_after_message_kb(order_id)
+    )
+
+@router.callback_query(F.data.startswith("ADMIN:NEED_CLOSE:"))
+async def admin_need_close(cb: CallbackQuery):
+    if not await is_admin(cb.from_user.id):
+        await cb.answer("Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        order_id = parse_admin_need_close(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    ok, alert, _ = await close_need_info(
+        bot=cb.bot,
+        order_id=order_id,
+        admin_tg_id=cb.from_user.id,
+        reply_text=None,
+    )
+
+    if not ok:
+        await cb.answer(alert, show_alert=True)
+        return
+
+    await cb.answer(alert, show_alert=True)
+
+    refreshed = await get_admin_order(order_id)
+    await cb.message.edit_text(
+        render_order_card(refreshed),
+        reply_markup=order_actions_kb(order_id, refreshed["status"]),
+    )
+
+@router.callback_query(F.data.startswith("ADMIN:NEED_REPLY:"))
+async def admin_need_reply_start(cb: CallbackQuery, state: FSMContext):
+    if not await is_admin(cb.from_user.id):
+        await cb.answer("Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        order_id = parse_admin_need_reply(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    order = await get_admin_order(order_id)
+    if not order:
+        await cb.answer("Замовлення не знайдено.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(need_info_order_id=order_id)
+    await state.set_state(AdminFSM.need_info_reply)
+
+    await cb.message.edit_text(
+        f"💬 Відповідь клієнту по замовленню №{order_id}\n\n"
+        "Надішліть текст відповіді одним повідомленням:",
+        reply_markup=admin_back_kb(f"ADMIN:OPEN:{order_id}"),
+    )
+    await cb.answer()
+
+@router.message(AdminFSM.need_info_reply)
+async def admin_need_reply_send(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("Доступ заборонено.")
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    order_id = int(data["need_info_order_id"])
+
+    text = (message.text or "").strip()
     if len(text) < 2:
         await message.answer("Текст відповіді занадто короткий.")
         return
 
-    order = await _get_order(order_id)
-    if not order:
-        await message.answer("Замовлення не знайдено.")
+    ok, alert, _ = await close_need_info(
+        bot=message.bot,
+        order_id=order_id,
+        admin_tg_id=message.from_user.id,
+        reply_text=text,
+    )
+
+    if not ok:
+        await message.answer(alert)
         await state.clear()
         return
 
-    client_tg = int(order["client_tg"])
-    await message.bot.send_message(
-        client_tg,
-        f"💬 Відповідь менеджера по замовленню №{order_id}:\n\n{text}"
-    )
-
-    old_status = order["status"]
-    next_status = OrderStatus.PRICE_SENT.value if order["price_amount"] is not None else OrderStatus.NEW.value
-
-    if old_status == OrderStatus.NEED_INFO.value:
-        await execute("UPDATE orders SET status=$2 WHERE order_id=$1", order_id, next_status)
-
-        await _log_status(
-            order_id=order_id,
-            old_status=old_status,
-            new_status=next_status,
-            tg_id=message.from_user.id,
-            comment=f"NEED_INFO answered: {text}",
-        )
-
-        try:
-            await message.bot.send_message(
-                client_tg,
-                f"✅ Уточнення враховано. Статус замовлення №{order_id}: {status_ua(next_status)}"
-            )
-        except Exception:
-            pass
-    else:
-        await _log_status(
-            order_id=order_id,
-            old_status=old_status,
-            new_status=old_status,
-            tg_id=message.from_user.id,
-            comment=f"Need-info reply (status unchanged): {text}",
-        )
-
     await state.clear()
-    await message.answer("✅ Відповідь надіслано клієнту.")
+    await message.answer(f"✅ {alert}")
 
 @router.callback_query(F.data.startswith("ADMIN:SET_PRICE:"))
 async def admin_set_price_start(cb: CallbackQuery, state: FSMContext):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    order_id = int(cb.data.split(":")[-1])
-    order = await _get_order(order_id)
+    try:
+        order_id = parse_admin_set_price(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    order = await get_admin_order(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
@@ -472,27 +339,29 @@ async def admin_set_price_start(cb: CallbackQuery, state: FSMContext):
         f"{order['category']} ➡️ {order['service']}\n"
         f"Кількість: {order['quantity']}\n\n"
         "Введіть ціну у гривнях:",
-        reply_markup=back_kb(f"ADMIN:OPEN:{order_id}"),
+        reply_markup=admin_back_kb(f"ADMIN:OPEN:{order_id}"),
     )
     await cb.answer()
 
 @router.message(AdminFSM.set_price)
 async def admin_set_price_value(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         await state.clear()
         return
 
     raw = (message.text or "").strip().replace(",", ".")
     try:
-        price = float(raw)
-    except ValueError:
-        await message.answer("Некоректна ціна. Спробуйте ще раз.")
+        price = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        await message.answer("Некоректна ціна. Введіть число, наприклад: 120 або 120.50")
         return
 
     if price < 0:
         await message.answer("Ціна не може бути від’ємною.")
         return
+
+    price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     await state.update_data(price_amount=price)
     await state.set_state(AdminFSM.set_price_comment)
@@ -500,20 +369,25 @@ async def admin_set_price_value(message: Message, state: FSMContext):
 
 @router.message(AdminFSM.set_price_comment)
 async def admin_set_price_comment(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         await state.clear()
         return
 
     data = await state.get_data()
     order_id = int(data["order_id"])
-    price_amount = float(data["price_amount"])
+
+    price_amount = data.get("price_amount")
+    if price_amount is None:
+        await message.answer("Помилка стану: ціна не знайдена. Почніть встановлення ціни заново.")
+        await state.clear()
+        return
 
     price_comment = (message.text or "").strip()
     if price_comment == "-":
         price_comment = None
 
-    order = await _get_order(order_id)
+    order = await get_admin_order(order_id)
     if not order:
         await message.answer("Замовлення не знайдено.")
         await state.clear()
@@ -525,41 +399,19 @@ async def admin_set_price_comment(message: Message, state: FSMContext):
         return
 
     old_status = order["status"]
-    new_status = OrderStatus.PRICE_SENT.value
+    new_status = await set_price_and_mark_price_sent(order_id, price_amount, price_comment)
 
-    await execute(
-        """
-        UPDATE orders
-        SET price_amount=$2,
-            price_comment=$3,
-            price_sent_at=now(),
-            status=$4
-        WHERE order_id=$1
-        """,
-        order_id,
-        price_amount,
-        price_comment,
-        new_status,
-    )
-
-    await _log_status(
+    await log_status(
         order_id=order_id,
         old_status=old_status,
         new_status=new_status,
+        role=ActorRole.ADMIN.value,
         tg_id=message.from_user.id,
-        comment=f"price_amount={price_amount}; price_comment={(price_comment or '-')}",
+        comment=f"price_amount={format_price(price_amount)}; price_comment={(price_comment or '-')}",
     )
 
     client_tg = int(order["client_tg"])
-    text_to_client = (
-        "💰 Розрахунок вартості замовлення готовий!\n"
-        f"Замовлення №{order_id}\n"
-        f"{order['category']} ➡️ {order['service']}\n"
-        f"Кількість: {order['quantity']}\n"
-        f"Ціна: {price_amount:.2f} грн\n"
-        f"Коментар: {(price_comment or '-')}\n\n"
-        "Підтвердіть замовлення щоб ми почали роботу."
-    )
+    text_to_client = render_price_sent_to_client(order_id, order, price_amount, price_comment)
     await message.bot.send_message(client_tg, text_to_client, reply_markup=price_confirm_kb(order_id))
 
     await state.clear()
@@ -567,104 +419,78 @@ async def admin_set_price_comment(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("ADMIN:STATUS:"))
 async def admin_set_status(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    parts = cb.data.split(":")
-    order_id = int(parts[2])
-    new_status = parts[3]
+    try:
+        order_id, new_status = parse_admin_status(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
 
-    order = await _get_order(order_id)
+    order = await get_admin_order(order_id)
     if not order:
         await cb.answer("Замовлення не знайдено.", show_alert=True)
         return
 
     old_status = order["status"]
 
-    if new_status not in (
-        OrderStatus.IN_PROGRESS.value,
-        OrderStatus.READY.value,
-        OrderStatus.DONE.value,
-        OrderStatus.CANCELED.value,
-    ):
-        await cb.answer("Невідомий статус.", show_alert=True)
+    result = await admin_change_order_status(
+        order_id=order_id,
+        old_status=old_status,
+        new_status=new_status,
+        admin_tg_id=cb.from_user.id,
+    )
+
+    if not result.ok:
+        await cb.answer(result.alert, show_alert=True)
         return
-
-    allowed = {
-        OrderStatus.PAYMENT_REPORTED.value: {OrderStatus.IN_PROGRESS.value, OrderStatus.CANCELED.value},
-        OrderStatus.IN_PROGRESS.value: {OrderStatus.READY.value, OrderStatus.DONE.value, OrderStatus.CANCELED.value},
-        OrderStatus.READY.value: {OrderStatus.DONE.value, OrderStatus.CANCELED.value},
-    }
-    if old_status in allowed and new_status not in allowed[old_status]:
-        await cb.answer(f"Не можна: {old_status} ➡️ {new_status}", show_alert=True)
-        return
-    if old_status not in allowed:
-        await cb.answer(f"Цей статус не підтримує зміну тут: {old_status}", show_alert=True)
-        return
-
-    time_field = _STATUS_TO_TIMEFIELD.get(new_status)
-    cancel_reason = None
-    comment = None
-
-    if new_status == OrderStatus.CANCELED.value:
-        cancel_reason = "Скасовано адміністратором"
-        comment = cancel_reason
-
-    if new_status == OrderStatus.CANCELED.value:
-        await execute(
-            f"""
-            UPDATE orders
-            SET status=$2,
-                {time_field}=now(),
-                cancel_reason=$3
-            WHERE order_id=$1
-            """,
-            order_id,
-            new_status,
-            cancel_reason,
-        )
-    else:
-        await execute(
-            f"""
-            UPDATE orders
-            SET status=$2,
-                {time_field}=now()
-            WHERE order_id=$1
-            """,
-            order_id,
-            new_status,
-        )
-
-    await _log_status(order_id, old_status, new_status, cb.from_user.id, comment)
 
     client_tg = int(order["client_tg"])
-    try:
-        await cb.bot.send_message(
-            client_tg,
-            f"ℹ️ Статус замовлення №{order_id} оновлено: {status_ua(new_status)}",
-        )
-    except Exception:
-        pass
+    if result.client_msg:
+        try:
+            await cb.bot.send_message(client_tg, result.client_msg)
+        except Exception:
+            pass
 
-    await cb.answer("Оновлено ✅", show_alert=True)
+    await cb.answer(result.alert, show_alert=True)
 
-    refreshed = await _get_order(order_id)
-    await cb.message.edit_text(_order_text(refreshed), reply_markup=order_actions_kb(order_id, refreshed["status"]))
+    refreshed = await get_admin_order(order_id)
+    await cb.message.edit_text(
+        render_order_card(refreshed),
+        reply_markup=order_actions_kb(order_id, refreshed["status"]),
+    )
 
 @router.callback_query(F.data.startswith("ADMIN:FILES:"))
 async def admin_files_cb(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    order_id = int(cb.data.split(":")[-1])
-    await _send_order_files(cb.message, order_id)
+    try:
+        order_id, role_filter = parse_admin_files(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    chat_id = cb.message.chat.id if cb.message else cb.from_user.id
+
+    async def reply_text(t: str):
+        await cb.bot.send_message(chat_id, t)
+
+    await send_order_files_to_admin_chat(
+        bot=cb.bot,
+        chat_id=chat_id,
+        order_id=order_id,
+        role_filter=role_filter,
+        reply=reply_text,
+    )
     await cb.answer()
 
 @router.message(Command("order_files"))
 async def admin_files_cmd(message: Message, command: CommandObject):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         return
 
@@ -674,22 +500,21 @@ async def admin_files_cmd(message: Message, command: CommandObject):
         return
 
     order_id = int(args)
-    await _send_order_files(message, order_id)
+    await send_order_files_to_admin_chat(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        order_id=order_id,
+        role_filter=None,
+        reply=message.answer,
+    )
 
 @router.callback_query(F.data == "ADMIN:SUPPORT:LIST")
 async def admin_support_list(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    row = await fetchrow(
-        """
-        SELECT array_agg(request_id ORDER BY created_at DESC) AS ids
-        FROM support_requests
-        WHERE status='OPEN'
-        """
-    )
-    ids = row["ids"] if row and row["ids"] else []
+    ids = await list_open_support_request_ids(limit=50)
     if not ids:
         await cb.message.edit_text("Відкритих звернень немає ✅", reply_markup=admin_menu_kb())
         await cb.answer()
@@ -700,45 +525,46 @@ async def admin_support_list(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ADMIN:SUPPORT:OPEN:"))
 async def admin_support_open(cb: CallbackQuery):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    request_id = int(cb.data.split(":")[-1])
-    row = await fetchrow(
-        """
-        SELECT sr.request_id, sr.status, sr.topic, sr.message, sr.created_at,
-               c.telegram_id AS client_tg
-        FROM support_requests sr
-        JOIN clients c ON c.client_id = sr.client_id
-        WHERE sr.request_id=$1
-        """,
-        request_id,
-    )
+    try:
+        action, request_id = parse_admin_support_action(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    if action != "OPEN":
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    row = await get_support_request_with_client(request_id)
     if not row:
         await cb.answer("Звернення не знайдено.", show_alert=True)
         return
 
-    text = (
-        "🆘 Звернення підтримки\n"
-        f"Request ID: {row['request_id']}\n"
-        f"Статус: {row['status']}\n"
-        f"Client TG: {row['client_tg']}\n"
-        f"Тема: {row['topic']}\n\n"
-        f"{row['message']}"
-    )
+    text = render_admin_support_request(row)
     await cb.message.edit_text(text, reply_markup=support_actions_kb(request_id))
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ADMIN:SUPPORT:REPLY:"))
 async def admin_support_reply_start(cb: CallbackQuery, state: FSMContext):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    request_id = int(cb.data.split(":")[-1])
+    try:
+        action, request_id = parse_admin_support_action(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
 
-    row = await fetchrow("SELECT request_id, status FROM support_requests WHERE request_id=$1", request_id)
+    if action != "REPLY":
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    row = await get_support_request(request_id)
     if not row:
         await cb.answer("Звернення не знайдено.", show_alert=True)
         return
@@ -753,13 +579,13 @@ async def admin_support_reply_start(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         f"✍️ Відповідь на звернення №{request_id}\n\n"
         "Надішліть текст відповіді одним повідомленням:",
-        reply_markup=back_kb(f"ADMIN:SUPPORT:OPEN:{request_id}"),
+        reply_markup=admin_back_kb(cb_admin_support_open(request_id)),
     )
     await cb.answer()
 
 @router.message(AdminFSM.support_reply)
 async def admin_support_reply_send(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         await state.clear()
         return
@@ -772,27 +598,36 @@ async def admin_support_reply_send(message: Message, state: FSMContext):
         await message.answer("Текст відповіді занадто короткий.")
         return
 
-    result = await _close_support_with_reply(message.bot, request_id, reply_text)
+    result = await close_support_with_reply(message.bot, request_id, reply_text)
 
     await state.clear()
     await message.answer(result)
 
 @router.callback_query(F.data.startswith("ADMIN:SUPPORT:CLOSE:"))
 async def admin_support_close(cb: CallbackQuery, state: FSMContext):
-    if not await _is_admin(cb.from_user.id):
+    if not await is_admin(cb.from_user.id):
         await cb.answer("Доступ заборонено.", show_alert=True)
         return
 
-    request_id = int(cb.data.split(":")[-1])
+    try:
+        action, request_id = parse_admin_support_action(cb.data)
+    except CallbackParseError:
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    if action != "CLOSE":
+        await cb.answer("Некоректна кнопка.", show_alert=True)
+        return
+
     await state.clear()
 
-    result = await _close_support_without_reply(request_id)
+    result = await close_support_without_reply(request_id)
     await cb.answer("Готово ✅", show_alert=True)
-    await cb.message.edit_text(result, reply_markup=back_kb("ADMIN:SUPPORT:LIST"))
+    await cb.message.edit_text(result, reply_markup=admin_back_kb("ADMIN:SUPPORT:LIST"))
 
 @router.message(Command("support_reply"))
 async def support_reply_cmd(message: Message, command: CommandObject):
-    if not await _is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("Доступ заборонено.")
         return
 
@@ -817,5 +652,5 @@ async def support_reply_cmd(message: Message, command: CommandObject):
         await message.answer("Текст відповіді занадто короткий.")
         return
 
-    result = await _close_support_with_reply(message.bot, request_id, reply_text)
+    result = await close_support_with_reply(message.bot, request_id, reply_text)
     await message.answer(result)

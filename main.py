@@ -37,4 +37,7 @@ async def main():
         await close_db_pool()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
